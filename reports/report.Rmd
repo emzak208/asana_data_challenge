@@ -1,0 +1,237 @@
+---
+title: "What drives Asana user adoption?"
+author: "Eric Chang"
+date: "3/5/2018"
+output:
+  html_document:
+    theme: cerulean
+
+---
+
+### Introduction
+
+In this data exploration, we aim to identify actionable factors that drive adoption, and suggest improvements in the Asana onboarding process. Our dataset consists of login activity for 12,000 users, and data on each account (email domain, signup method, etc.). We also created additional features to capture effects that we hypothesize might drive adoption.  
+
+To capture the "cohesion" effect (lots of other adopted users in the org makes the new user more likely to adopt), we introduced the features: `org_num_adopted`, `org_percent_adopted`, `org_num_users`, `invited_by_adopted` (we removed the adoption status of each user when creating `org_num_adopted`, so as to not accidentally leak the answer to the model) To account for possible seasonality, we introduced `creation_month` and `creation_year`. And to capture recency / speed of onboarding, we introduced `days_between_creation_firstuse`.
+
+
+```{r, include=FALSE, message=FALSE}
+library(tidyverse)
+library(ggplot2)
+
+# Read data
+REPO_PATH <- "/Users/eric/Documents/asana_challenge"
+knitr::opts_knit$set(root.dir = REPO_PATH)
+setwd(REPO_PATH)
+
+source("./src/feature_engineering.R")
+```
+
+
+```{r, echo=F}
+set.seed(123)
+
+feature_subset <- user_features %>%
+  select(-user_id, -org_id, -invited_by_user_id, -creation_date, -adoption_date,
+         -first_engagement, -creation_day_of_week) %>%
+  mutate(is_adopted = as.factor(is_adopted),
+         creation_year = as.factor(creation_year),
+         creation_month = as.factor(creation_month),
+         days_between_creation_firstuse = as.integer(days_between_creation_firstuse))
+
+# Impute days
+feature_subset$days_between_creation_firstuse[is.na(feature_subset$days_between_creation_firstuse)] = 
+  mean(feature_subset$days_between_creation_firstuse[!is.na(feature_subset$days_between_creation_firstuse)])
+
+# Sample non-adopted for class imbalance.
+adopted <- filter(feature_subset, is_adopted == 1)
+not_adopted <- filter(feature_subset, is_adopted == 0) %>% 
+  sample_n(3000)
+train <- bind_rows(adopted, not_adopted)
+```
+
+```{r, echo=F}
+rf <- randomForest::randomForest(is_adopted ~ .,
+                                 data = train,
+                                 importance = T,
+                                 ntree = 2000)
+
+var_importance <- randomForest::importance(rf, class = 1, scale = TRUE)[, "MeanDecreaseAccuracy"]
+var_importance <- data.frame(variable = names(var_importance), mean_decrease_accuracy = var_importance) %>% 
+  arrange(desc(mean_decrease_accuracy))
+var_importance$variable <- factor(var_importance$variable, levels = var_importance$variable %>% as.character() %>% rev())
+```
+
+
+### Predictive Model
+
+Let's start by training a model to predict user adoption, and assess its performance. The model used here is a Random Forest, which achieves high predictive accuracy at the cost of interpretability.  
+
+Since there are many more nonadopted users (86.2%) than adopted users (13.8%), we sampled the nonadopted users to level out the classes a bit. The adjusted dataset has around 35% adopted and 65% nonadopted users. The naive model of guessing that no users adopt would get us an error rate of 35% - this is the baseline we're trying to beat.  
+
+**The validated model gets a test set error rate of 26.74%.** This is a decent improvement over the naive result, and means that there is some  signal in the data. Now let's take a look at the variable importances:
+
+#### Feature Importance
+
+```{r, echo=F, fig.width=6, fig.height=3}
+ggplot(var_importance) +
+  stat_identity(aes(x = variable, y = mean_decrease_accuracy, fill = variable), geom = "bar") +
+  coord_flip() +
+  ggtitle("Variable Importance Plot") +
+  guides(fill=FALSE) +
+  ylab("Relative Importance") + xlab("Feature") + ggthemes::theme_pander() + ggthemes::scale_fill_pander()
+```
+
+
+Our feature importance analysis reveals some interesting results:  
+
+- Time between account creation and first login is highly predictive of adoption.
+- Organization-level features are also very predictive.
+- There seems to be some seasonal effect.
+- Surprisingly, whether or not a user is opted into the mailing list doesn't seem to indicate adoption. We'll validate this later on.
+
+### Interpretive Model
+
+For a deeper look into driving factors, we'll use a logistic regression, which allows us to examine the effects of individual features. Below are some selected regression coefficients with p-values < 0.10 (the convention is 0.05, but due to our relatively noisy dataset, we'll relax that a bit to investigate more features). Negative values indicate a lower likelihood of adoption.
+
+```{r logistic_regression, results="asis", echo=F}
+# Models with all predictors.
+regr <- glm(as.factor(is_adopted) ~ ., family = "binomial", data = train)
+# summary(regr)
+regr_summary <- data.frame(summary(regr)$coefficients)
+regr_summary$feature <- row.names(regr_summary)
+names(regr_summary) <- c("coefficient", "stderror", "z", "p_value", "feature")
+
+table <- 
+  regr_summary %>% 
+    filter(p_value < 0.10,
+           feature %in% c("creation_sourceORG_INVITE",
+                          "creation_sourcePERSONAL_PROJECTS",
+                          "creation_year2014",
+                          "creation_month5",
+                          "days_between_creation_firstuse",
+                          "invited_by_adopted",
+                          "org_num_users",
+                          "org_num_adopted",
+                          "org_percent_adopted")) %>%
+  select(feature, coefficient, p_value) %>% 
+  mutate(coefficient = round(coefficient, 3),
+         p_value = round(p_value, 4))
+
+library(knitr)
+library(kableExtra)
+table %>%
+    kable("html") %>%
+    kable_styling(full_width = F, position = "float_right")
+```
+
+### Results
+
+#### There is a sweet spot for the size of a team.
+
+One surprising result is the negative coefficient for `org_num_users`, which suggests that large teams have lower adoption rates. A closer look (and additional model) reveals a nonlinear relationship between adoption and the size of the group. On the left, the plot represents each org as a point, plotting the  % of adopted users in the org against the size of the org. On the right, we plot the predictions from an additional model that estimates adoption probability using only org size.
+
+```{r adoption_by_org_size, echo=F, fig.width=10, fig.height=3, message=F, warning=F}
+library(splines)
+regr <- glm(is_adopted ~ bs(org_num_users, df = 10), family = "binomial", data = user_features)
+
+adoption_by_org_size <- 
+  user_features %>% 
+    group_by(org_id) %>% 
+    summarise(org_num_users = first(org_num_users),
+              org_percent_adopted = first(org_percent_adopted)) %>% 
+  ggplot() +
+    geom_point(aes(x = org_num_users, y = org_percent_adopted), size = 2, alpha = 0.5, color = "orange") +
+    ggtitle("Proportion of adopted users by org size") + xlab("# Users in Organization") + ylab("Fraction Adopted Users") +
+    ggthemes::theme_pander()
+
+x <- data.frame(org_num_users = seq(0, 300, 1))
+y <- predict(regr, x, type = "response")
+
+prob_adoption_by_org_size <- 
+  ggplot(data = data.frame(x, y), aes(x, y)) +
+    geom_point(size = 1, alpha = 0.5, color = "cyan") +
+    ggthemes::theme_pander() +
+  ggtitle("Predicted probability of adoption by org size") +
+  xlab("# Users in Organization") + ylab("Predicted Probability of Adoption")
+
+gridExtra::grid.arrange(adoption_by_org_size, prob_adoption_by_org_size, nrow = 1, ncol = 2)
+```
+
+**In both cases, we see that the highest adoption rates are exhibited by teams with around 10-40 members. This suggests that there is an ideal size for a team.**  
+
+One potential explanation is this: Asana is a tool made to facilitate team management and improve productivity. A team of 3 might be able to manage just fine without the use of software, whereas a team of 80 should probably be broken into sub-teams. **It's possible that Asana is the ideal tool for a certain size of team - not too big, and not too small. We can compare this to Agile methodology, where sprint planning meetings usually involve a 5-10 members of a team.**
+
+
+#### The best invitation is from an adopted Asana user, to a team workspace.
+
+We see that `invited_by_adopted` has a high positive coefficient, which means someone invited by an adopted user has a much higher chance of adoption, compared to someone invited by a regular user. A related observation is that `creation_source == PERSONAL_PROJECTS` has a very negative coefficient, suggesting that an invitation to another user's personal workspace is not an effective driver of adoption.  
+
+**These results suggest that the sense of community is a driver for adoption.** Being invited by an adopted user to a team workspace means that the new user will probably see a good amount of activity in the app, dashboards, and calendar. Being invited to a personal workspace means that the user will see far less activity. This could explain why "PERSONAL_PROJECTS" has the lowest adoption rate, by far.
+
+```{r creation_source_plot, echo=F, fig.height=2.5, fig.width=8}
+user_features %>%
+  group_by(creation_source) %>%
+  summarise(total = n(),
+            adopted = sum(is_adopted),
+            prop_adopted = adopted / total) %>%
+
+  ggplot() + stat_identity(aes(x = creation_source,
+                               y = prop_adopted,
+                               fill = creation_source), geom = "bar") +
+  ggtitle("Proportion of adopted users by account creation source") +
+  xlab("Creation Source") + ylab("Proportion of Adopted Users") +
+  guides(fill=FALSE) +
+  ggthemes::theme_pander() +
+  ggthemes::scale_fill_pander() 
+```
+
+#### Time between account creation and first login is a good predictor, but we can't jump to the causality conclusion.
+
+In both the random forest and the regression analysis, we see that `days_between_creation_firstuse` is a very predictive variable with a negative coefficient. **However, we can't conclude that speeding a user into the onboarding process will increase adoption rate without investigating further.** An possible reason for this is that users that are excited to try Asana will naturally log in earlier, and this coefficient is the result of that self-selection. Concluding causality will require more study.
+
+#### There are seasonality effects.
+
+In the models, we include `creation_year` and `creation_month` to control for seasonality effects. Take `creation_month5` for example: the negative coefficient means that users signing up in May are less likely to adopt. Below is an overlay of # of account creations (gray) and # of adoptions (orange) by month. We observe a clear spike in the # of signups in May, as well as a lower # of adoptions.  
+
+Possibly, there are times of year when companies are more likely to reorganize teams and introduce new tools. **It's important to be aware of this seasonality, but determining the source will require more research.**
+
+```{r account_creation_adoptions, echo=F, fig.height=3, fig.width=7}
+user_features %>% 
+  mutate(creation_month = lubridate::month(creation_month, label = T)) %>% 
+  group_by(creation_month) %>% 
+  summarise(num_users = n(),
+            num_adopted = sum(is_adopted)) %>% 
+ggplot() +
+  stat_identity(aes(x = creation_month, y = num_users), geom = "bar") +
+  stat_identity(aes(x = creation_month, y = num_adopted), geom = "bar", fill = "orange") +
+  ggtitle("Account creations and adoptions by month") + xlab("Month") + ylab("# Users") +
+  ggthemes::theme_pander()
+```
+
+#### The opt-in mailing list is not a good indicator of adoption.
+
+Somewhat surprisingly, both models identify `enabled_for_marking_drip` and `opted_in_to_mailing_list` as the insignificant variables, suggesting that it's not a driver or predictor of adoption.
+
+### Takeaways
+
+Imagine this: Anna is a new user, logging into Asana for the first time. She was invited into a personal project, so all she sees are a couple of tasks and her coworker's calendar. It's pretty lonely.  
+
+Now imagine: Bob signs into Asana for the first time. He's been invited into a group with 120 people. He logs in, and his dashboard is brimming with tasks, milestones, and notes. It's overwhelming! He logs out and locks himself in a dark conference room to calm down for a bit.  
+
+Finally, imagine: you get an invite to Asana from your manager. You sign in, open up the roadmap and task list, and immediately recognize the coworkers on your team. Clicking into the roadmap, you see there's already some great discussion on one of the milestones. **Now you can't wait to start using Asana yourself.**   
+
+**We identified several potential driving factors for adoption: team size, inviter adoption status, and initial workspace. These all point to the conclusion that a new user that is brought into a welcoming, lively, productive first experience is more likely to stick around.**
+
+**To improve adoption, the onboarding process could be used to foster this sense of community and energy. Some possibilities:**  
+
+- **When a user logs in for the first time, she can immediately be brought to a screen with a list of their coworkers, showing that the team community is already there.**  
+- **Existing users can be alerted to new team members on Asana, with a notification, and a suggestion to connect or say hi.**  
+- **Since the "goldilocks" team size seems to be an adoption driver, a feature could be implemented that allows teams to be categorized into sub-teams once they get too big. Or, if a team is too small, the app could notify the administrator with the advice that Asana works best for teams of size X to Y.**  
+
+
+#### Other considerations and limitations
+
+- In this exploration, we used and featurized a binary output - whether or not a user adopted is a yes-or-no response. We haven't captured the *intensity* of usage; features like the mean number of weekly logins could help us investigate further.
+- The overall performance of the model, while improved over baseline, is not highly predictive, meaning additional tuning and feature extraction could be helpful.
+- There are some inconsistent results between the random forest and logistic regression, pointing to the presence of nonlinear effects. This will require more research.
