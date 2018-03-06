@@ -1,5 +1,5 @@
-#### Asana Data Science Challenge
-##### Eric Chang
+## Asana Data Science Challenge
+#### Eric Chang
 
 To reproduce the results, first place `takehome_users-intern.csv` and `takehome_user_engagement-intern.csv` into `/data`.
 
