@@ -2,14 +2,12 @@ library(tidyverse)
 library(lubridate)
 
 
-REPO_PATH <- "/Users/eric/Documents/asana_challenge"
 ADOPTION_PATH <- "./data/adoption.csv"
 ENGAGEMENT_PATH <- "./data/takehome_user_engagement-intern.csv"
 USERS_PATH <- "./data/takehome_users-intern.csv"
 
 
 #' Read data.
-setwd(REPO_PATH)
 engagement_raw <- readr::read_csv(ENGAGEMENT_PATH)
 users_raw <- readr::read_csv(USERS_PATH)
 adoption_raw <- readr::read_csv(ADOPTION_PATH)
@@ -44,8 +42,7 @@ top_emails <- users$email_domain %>%
 # There's probably a cohesion effect with adoption
 org_users <- users %>% 
   group_by(org_id) %>% 
-  summarise(org_num_users = n())  # Tempting to look at # of adopted users, but that'd introduce leakage
-
+  summarise(org_num_users = n())
 
 user_features <- users %>%
   select(-name, -email, -last_session_creation_time) %>% 
@@ -69,4 +66,15 @@ user_features <- users %>%
   left_join(org_users, by = "org_id") %>% 
   mutate(org_id = org_id %>% as.factor())
 
-str(user_features)
+org_adoption <- user_features %>%
+  group_by(org_id) %>% 
+  summarise(org_num_adopted = sum(is_adopted))
+
+user_features <- user_features %>% 
+  left_join(org_adoption, by = "org_id") %>% 
+  # Very important: remove the user's adoption status, otherwise it's leakage.
+  mutate(org_num_adopted = ifelse(is.na(org_num_adopted), 0, org_num_adopted),
+         org_num_adopted = org_num_adopted - is_adopted,
+         org_percent_adopted = org_num_adopted / org_num_users)
+  
+

@@ -29,7 +29,7 @@ def get_previous_week_visits(df, n_days=7):
 
     # Join each user's daily activity to itself.
     days_df = pd.merge(df, df[['user_id', 'date']], how='left', on=['user_id'])
-    within_prev_week = (days_df['date_y'] > days_df['previous_week']) & (days_df['date_y'] <= days_df['date_x'])
+    within_prev_week = (days_df['date_y'] >= days_df['previous_week']) & (days_df['date_y'] <= days_df['date_x'])
     days_df = days_df.loc[within_prev_week]
 
     visits = days_df.groupby(['user_id', 'date_x'], as_index=False).count()
